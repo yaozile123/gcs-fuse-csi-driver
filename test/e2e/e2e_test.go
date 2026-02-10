@@ -25,10 +25,11 @@ import (
 	"strings"
 	"testing"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"local/test/e2e/specs"
 	"local/test/e2e/testsuites"
 	"local/test/e2e/utils"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"context"
 
@@ -60,6 +61,12 @@ var (
 
 var _ = func() bool {
 	testing.Init()
+
+	// Load the integration test configurations before Ginkgo parses the test tree
+	if err := utils.LoadTestConfig(); err != nil {
+		klog.Fatalf("Failed to load generic test_config.yaml: %v", err)
+	}
+
 	if os.Getenv(clientcmd.RecommendedConfigPathEnvVar) == "" {
 		kubeconfig := filepath.Join(os.Getenv("HOME"), ".kube", "config")
 		os.Setenv(clientcmd.RecommendedConfigPathEnvVar, kubeconfig)
