@@ -62,10 +62,12 @@ var (
 var _ = func() bool {
 	testing.Init()
 
+	klog.Info("Loading test config")
 	// Load the integration test configurations before Ginkgo parses the test tree
 	if err := utils.LoadTestConfig(); err != nil {
 		klog.Fatalf("Failed to load generic test_config.yaml: %v", err)
 	}
+	klog.Infof("Successfully loaded %d test packages from test_config.yaml", len(utils.LoadedTestPackages))
 
 	if os.Getenv(clientcmd.RecommendedConfigPathEnvVar) == "" {
 		kubeconfig := filepath.Join(os.Getenv("HOME"), ".kube", "config")

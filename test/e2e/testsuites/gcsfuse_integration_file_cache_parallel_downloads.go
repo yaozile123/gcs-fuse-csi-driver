@@ -209,8 +209,8 @@ func (t *gcsFuseCSIGCSFuseIntegrationFileCacheParallelDownloadsTestSuite) Define
 		tPod := specs.NewTestPod(f.ClientSet, f.Namespace)
 		tPod.SetImage(specs.GolangImage)
 
-		logFileDir := path.Join(gkeTempDir, testName)
-		logFilePath := path.Join(logFileDir, ".log")
+		logFilePath := path.Join(gkeTempDir, fmt.Sprintf("%s.log", testName))
+		framework.Logf("Log file path: %v", logFilePath)
 		tPod.SetCommand(fmt.Sprintf("tail -F %v", logFilePath))
 
 		tPod.SetResource("1", "1Gi", "5Gi")
@@ -219,12 +219,11 @@ func (t *gcsFuseCSIGCSFuseIntegrationFileCacheParallelDownloadsTestSuite) Define
 		}
 
 		l.volumeResource.VolSource.CSI.VolumeAttributes["fileCacheCapacity"] = fileCacheCapacity
-		tPod.SetupTmpVolumeMount(logFileDir)
+		tPod.SetupTmpVolumeMount(gkeTempDir)
 		gcsfuseVersion := version.MustParseSemantic(gcsfuseVersionStr)
 		cacheFilePath := path.Join(gkeTempDir, testName)
+		framework.Logf("Cache file path: %v", cacheFilePath)
 		tPod.SetupCacheVolumeMount(cacheFilePath, ".volumes/"+volumeName)
-
-		mountOptions = append(mountOptions, "logging:file-path:/gcsfuse-tmp/log.json")
 
 		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, readOnly, mountOptions...)
 		tPod.SetAnnotations(map[string]string{
@@ -268,31 +267,39 @@ func (t *gcsFuseCSIGCSFuseIntegrationFileCacheParallelDownloadsTestSuite) Define
 			fmt.Sprintf("GODEBUG=asyncpreemptoff=1 go test ./read_cache/... -p 1 --integrationTest -v -run %v --config-file=./test_config.yaml", testName),
 		}
 		baseTestCommand := strings.Join(commandArgs, " && ")
+		framework.Logf("Executing tests with command:\n%s", baseTestCommand)
 		tPod.VerifyExecInPodSucceedWithFullOutput(f, specs.TesterContainerName, baseTestCommand)
 	}
 
 	generateDynamicTests := func() {
+		framework.Logf("===> Entering generateDynamicTests for parallel downloads")
 		// Dynamically generate tests from test_config.yaml in GCSFuse
 		for pkgName, pkgList := range utils.LoadedTestPackages {
+			framework.Logf("===> Checking package: %s", pkgName)
 			if !utils.IsFileCacheEnabled(pkgName) {
 				continue
 			}
+			framework.Logf("===> Package %s handles file caching, proceeding", pkgName)
 			// The YAML parser treats test package as a list because of the '-' syntax.
 			// But there is only one configuration item under each package, so we take the first element.
 			pkg := pkgList[0]
 			for _, config := range pkg.Configs {
 				if !config.RunOnGke {
+					framework.Logf("===> Skipping config %s for %s, RunOnGke is false", config.Run, pkgName)
 					continue
 				}
 				if !config.Compatible.HNS && hnsEnabled(driver) {
+					framework.Logf("===> Skipping config %s for %s, HNS incompatible", config.Run, pkgName)
 					continue
 				}
 				if !config.Compatible.Zonal && zbEnabled(driver) {
+					framework.Logf("===> Skipping config %s for %s, Zonal incompatible", config.Run, pkgName)
 					continue
 				}
 
 				for _, flagStr := range config.Flags {
 					if !utils.IsParallelDownloadsEnabled(flagStr) {
+						framework.Logf("===> Skipping flags '%s' for %s, Parallel downloads NOT enabled", flagStr, config.Run)
 						continue
 					}
 
@@ -300,8 +307,13 @@ func (t *gcsFuseCSIGCSFuseIntegrationFileCacheParallelDownloadsTestSuite) Define
 					if testName == "" {
 						testName = pkgName
 					}
+					framework.Logf("===> Registering test: %s with flags: %s", testName, flagStr)
 					ginkgo.It(fmt.Sprintf("should succeed in %s with flags %s", testName, flagStr), func() {
+						framework.Logf("===> Starting parallel download test: %s", testName)
+						framework.Logf("===> Original flag string from config: %s", flagStr)
+
 						if utils.IsOnlyDirEnabled(pkg) {
+							framework.Logf("===> only_dir is enabled for this test package")
 							init(specs.SubfolderInBucketPrefix)
 						} else {
 							init()
@@ -312,6 +324,8 @@ func (t *gcsFuseCSIGCSFuseIntegrationFileCacheParallelDownloadsTestSuite) Define
 						readOnly := parsedFlags.ReadOnly
 						fileCacheCapacity := parsedFlags.FileCacheCapacity
 						mountOptions := parsedFlags.MountOptions
+
+						framework.Logf("===> Parsed arguments: readOnly=%v, fileCacheCapacity=%s, mountOptions=%v", readOnly, fileCacheCapacity, mountOptions)
 
 						gcsfuseIntegrationFileCacheTestNew(testName, readOnly, fileCacheCapacity, mountOptions...)
 					})
@@ -457,6 +471,7 @@ func (t *gcsFuseCSIGCSFuseIntegrationFileCacheParallelDownloadsTestSuite) Define
 		})
 	}
 
+	framework.Logf("Generating tests based on test config")
 	if utils.IsReadFromTestConfig() {
 		generateDynamicTests()
 	} else {

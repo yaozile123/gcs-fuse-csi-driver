@@ -202,6 +202,7 @@ type TestBucketType struct {
 type TestPackages map[string][]TestPackage
 
 func LoadTestConfig() error {
+	klog.Infof("LoadTestConfig: Fetching test config from %v", testConfigUrl)
 	resp, err := http.Get(testConfigUrl)
 	if err != nil {
 		return fmt.Errorf("failed to fetch test config: %w", err)
@@ -219,9 +220,11 @@ func LoadTestConfig() error {
 
 	config, err := ParseTestConfig(body)
 	if err != nil {
+		klog.Errorf("LoadTestConfig: failed to parse test config: %v", err)
 		return fmt.Errorf("failed to parse test config: %w", err)
 	}
 
+	klog.Infof("LoadTestConfig: Successfully loaded and parsed %d test packages", len(config))
 	LoadedTestPackages = config
 	return nil
 }
@@ -283,7 +286,7 @@ func ParseConfigFlags(flagStr string) ParsedConfig {
 
 func IsReadFromTestConfig() bool {
 	// TODO: implement
-	return false
+	return true
 }
 
 // Extracts the only-dir UUID from the mountOptions string.
