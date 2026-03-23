@@ -146,6 +146,13 @@ func Handle(testParams *TestParameters) error {
 			klog.Fatalf(`env variable %q could not be set: %v`, ClusterLocationEnvVar, err)
 		}
 
+		// Enable the Cloud Profiler API for cloud_profiler test package in GCSFuse integration tests.
+		klog.Infof("Enabling Cloud Profiler API for project %s", testParams.ProjectID)
+		cmdEnableAPI := exec.Command("gcloud", "services", "enable", "cloudprofiler.googleapis.com", "--project", testParams.ProjectID)
+		if output, err := cmdEnableAPI.CombinedOutput(); err != nil {
+			klog.Errorf("Failed to enable Cloud Profiler API: %s, err: %v", string(output), err)
+		}
+
 		// 4. After the test, tear down the cluster, and switch back to the old project.
 		defer func() {
 			if err := setEnvProject(oldProject); err != nil {

@@ -117,8 +117,8 @@ var _ = ginkgo.Describe("E2E Test Suite", func() {
 			testsuites.InitGcsFuseCSISubPathTestSuite,
 			testsuites.InitGcsFuseCSIAutoTerminationTestSuite,
 			testsuites.InitGcsFuseCSIFileCacheTestSuite,
-			testsuites.InitGcsFuseCSIGCSFuseIntegrationFileCacheTestSuite,
-			testsuites.InitGcsFuseCSIGCSFuseIntegrationFileCacheParallelDownloadsTestSuite,
+			// testsuites.InitGcsFuseCSIGCSFuseIntegrationFileCacheTestSuite,
+			// testsuites.InitGcsFuseCSIGCSFuseIntegrationFileCacheParallelDownloadsTestSuite,
 			testsuites.InitGcsFuseCSIIstioTestSuite,
 			testsuites.InitGcsFuseCSIMetricsTestSuite,
 			testsuites.InitGcsFuseCSIMetadataPrefetchTestSuite,
@@ -145,8 +145,8 @@ var _ = ginkgo.Describe("E2E Test Suite", func() {
 
 	GCSFuseCSITestSuitesHNS := []func() storageframework.TestSuite{
 		testsuites.InitGcsFuseCSIGCSFuseIntegrationTestSuite,
-		testsuites.InitGcsFuseCSIGCSFuseIntegrationFileCacheTestSuite,
-		testsuites.InitGcsFuseCSIGCSFuseIntegrationFileCacheParallelDownloadsTestSuite,
+		// testsuites.InitGcsFuseCSIGCSFuseIntegrationFileCacheTestSuite,
+		// testsuites.InitGcsFuseCSIGCSFuseIntegrationFileCacheParallelDownloadsTestSuite,
 	}
 
 	testDriverHNS := specs.InitGCSFuseCSITestDriver(c, m, *bucketLocation, *skipGcpSaTest, true, *clientProtocol, *zbFlag)

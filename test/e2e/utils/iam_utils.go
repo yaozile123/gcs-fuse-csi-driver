@@ -349,6 +349,67 @@ func AddComputeBindingForAC(ctx context.Context) error {
 	return nil
 }
 
+// PrepareGcpSAName truncates the namespace to a maximum of 30 characters
+// to comply with GCP IAM Service Account accountId length constraints.
+func PrepareGcpSAName(ns string) string {
+	if len(ns) > 30 {
+		return ns[:30]
+	}
+	return ns
+}
+
+// AddCloudProfilerBindings binds the Service Account to Cloud Profiler roles.
+// This is needed for the cloud_profiler test package in GCSFuse integration test suite.
+func AddCloudProfilerBindings(ctx context.Context, namespace string) (func(), error) {
+	projectID := os.Getenv(ProjectEnvVar)
+	if projectID == "" {
+		return nil, fmt.Errorf("environment variable %s is not set", ProjectEnvVar)
+	}
+	projectNumber := os.Getenv(ProjectNumberEnvVar)
+	if projectNumber == "" {
+		return nil, fmt.Errorf("environment variable %s is not set", ProjectNumberEnvVar)
+	}
+
+	gcpSAName := PrepareGcpSAName(namespace)
+
+	members := []string{
+		fmt.Sprintf(
+			"principal://iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s.svc.id.goog/subject/ns/%s/sa/gcsfuse-csi-sa",
+			projectNumber, projectID, namespace,
+		),
+		fmt.Sprintf("serviceAccount:%s.svc.id.goog[%s/gcsfuse-csi-sa]", projectID, namespace),
+		fmt.Sprintf("serviceAccount:%s@%s.iam.gserviceaccount.com", gcpSAName, projectID),
+	}
+
+	if os.Getenv(IsOSSEnvVar) != "true" {
+		testEnv := os.Getenv(TestEnvEnvVar)
+		if testEnv == "" {
+			return nil, fmt.Errorf("environment variable %s is not set", TestEnvEnvVar)
+		}
+		robotAccount := EnvRobots[testEnv]
+		members = append(members, fmt.Sprintf("serviceAccount:service-%s@%s.iam.gserviceaccount.com", projectNumber, robotAccount))
+	}
+
+	var helpers []*TestGCPProjectIAMPolicyBinding
+	roles := []string{"roles/cloudprofiler.user", "roles/cloudprofiler.agent"}
+	for _, role := range roles {
+		for _, member := range members {
+			bindingHelper := NewTestGCPProjectIAMPolicyBinding(projectID, member, role, "")
+			bindingHelper.Create(ctx)
+			helpers = append(helpers, bindingHelper)
+		}
+	}
+
+	cleanupFunc := func() {
+		cleanupCtx := context.Background()
+		for _, helper := range helpers {
+			helper.Cleanup(cleanupCtx)
+		}
+	}
+
+	return cleanupFunc, nil
+}
+
 func determineDriverSA(projectID string, projectNumber string) (string, error) {
 	member := fmt.Sprintf(
 		"principalSet://iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s.svc.id.goog/namespace/gcs-fuse-csi-driver",

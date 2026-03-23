@@ -135,7 +135,7 @@ func (n *GCSFuseCSITestDriver) PrepareTest(ctx context.Context, f *e2eframework.
 	testK8sSA := utils.NewTestKubernetesServiceAccount(f.ClientSet, f.Namespace, K8sServiceAccountName, "")
 	var testGcpSA *utils.TestGCPServiceAccount
 	if !n.skipGcpSaTest {
-		testGcpSA = utils.NewTestGCPServiceAccount(prepareGcpSAName(f.Namespace.Name), n.meta.GetProjectID())
+		testGcpSA = utils.NewTestGCPServiceAccount(utils.PrepareGcpSAName(f.Namespace.Name), n.meta.GetProjectID())
 		testGcpSA.Create(ctx)
 		testGcpSA.AddIAMPolicyBinding(ctx, f.Namespace)
 
@@ -412,7 +412,7 @@ func (n *GCSFuseCSITestDriver) GetDynamicProvisionStorageClass(ctx context.Conte
 	// Set up the GCP Project IAM Policy
 	member := fmt.Sprintf("serviceAccount:%v.svc.id.goog[%v/%v]", n.meta.GetProjectID(), config.Framework.Namespace.Name, K8sServiceAccountName)
 	if !n.skipGcpSaTest {
-		member = fmt.Sprintf("serviceAccount:%v@%v.iam.gserviceaccount.com", prepareGcpSAName(config.Framework.Namespace.Name), n.meta.GetProjectID())
+		member = fmt.Sprintf("serviceAccount:%v@%v.iam.gserviceaccount.com", utils.PrepareGcpSAName(config.Framework.Namespace.Name), n.meta.GetProjectID())
 	}
 	testGCPProjectIAMPolicyBinding := utils.NewTestGCPProjectIAMPolicyBinding(n.meta.GetProjectID(), member, "roles/storage.admin", "")
 	testGCPProjectIAMPolicyBinding.Create(ctx)
@@ -474,7 +474,7 @@ func (n *GCSFuseCSITestDriver) SetIAMPolicy(ctx context.Context, bucket *storage
 
 	member := fmt.Sprintf("serviceAccount:%v.svc.id.goog[%v/%v]", n.meta.GetProjectID(), serviceAccountNamespace, serviceAccountName)
 	if !n.skipGcpSaTest {
-		member = fmt.Sprintf("serviceAccount:%v@%v.iam.gserviceaccount.com", prepareGcpSAName(serviceAccountNamespace), n.meta.GetProjectID())
+		member = fmt.Sprintf("serviceAccount:%v@%v.iam.gserviceaccount.com", utils.PrepareGcpSAName(serviceAccountNamespace), n.meta.GetProjectID())
 	}
 	if err := storageService.SetIAMPolicy(ctx, bucket, member, "roles/storage.admin"); err != nil {
 		e2eframework.Failf("Failed to set the IAM policy for the new GCS bucket: %v", err)
@@ -490,7 +490,7 @@ func (n *GCSFuseCSITestDriver) RemoveIAMPolicy(ctx context.Context, bucket *stor
 
 	member := fmt.Sprintf("serviceAccount:%v.svc.id.goog[%v/%v]", n.meta.GetProjectID(), serviceAccountNamespace, serviceAccountName)
 	if !n.skipGcpSaTest {
-		member = fmt.Sprintf("serviceAccount:%v@%v.iam.gserviceaccount.com", prepareGcpSAName(serviceAccountNamespace), n.meta.GetProjectID())
+		member = fmt.Sprintf("serviceAccount:%v@%v.iam.gserviceaccount.com", utils.PrepareGcpSAName(serviceAccountNamespace), n.meta.GetProjectID())
 	}
 	if err := storageService.RemoveIAMPolicy(ctx, bucket, member, "roles/storage.admin"); err != nil {
 		e2eframework.Failf("Failed to remove the IAM policy from the GCS bucket: %v", err)
@@ -543,14 +543,6 @@ func (n *GCSFuseCSITestDriver) deleteBucket(ctx context.Context, bucketName stri
 	}
 
 	return nil
-}
-
-func prepareGcpSAName(ns string) string {
-	if len(ns) > 30 {
-		return ns[:30]
-	}
-
-	return ns
 }
 
 func (n *GCSFuseCSITestDriver) CreateImplicitDirInBucket(ctx context.Context, dirPath, bucketName string) {
