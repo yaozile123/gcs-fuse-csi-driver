@@ -688,3 +688,13 @@ func (n *GCSFuseCSITestDriver) giveDriverAccessToBucketForProfiles(ctx context.C
 
 	return nil
 }
+
+func isProfilerTest() bool {
+	report := ginkgo.CurrentSpecReport()
+	return strings.Contains(report.FullText(), "cloud_profiler")
+}
+
+func isBillingTest() bool {
+	report := ginkgo.CurrentSpecReport()
+	return strings.Contains(report.FullText(), "billing-project")
+}
