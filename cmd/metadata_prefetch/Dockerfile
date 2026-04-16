@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Build metadata-prefetch go binary
-FROM --platform=$BUILDPLATFORM golang:1.26.1 AS metadata-prefetch-builder
+FROM --platform=$BUILDPLATFORM google-go.pkg.dev/golang:1.26.2@sha256:1bee769a7a50eea7730ac31f75182ae2614f50a70902407312db390a7c7cb2ff AS metadata-prefetch-builder
 
 ARG STAGINGVERSION
 ARG TARGETPLATFORM
@@ -23,7 +23,7 @@ ADD . .
 RUN GOARCH=$(echo $TARGETPLATFORM | cut -f2 -d '/') make metadata-prefetch BINDIR=/bin
 
 # Start from Kubernetes Debian base.
-FROM gke.gcr.io/debian-base:bookworm-v1.0.5-gke.12 AS debian
+FROM gke.gcr.io/debian-base:bookworm-v1.0.7-gke.2@sha256:1c204d6571a2add77c003188a8e72efd4e1c9e0d73dd1045eeef30b3a81adddc AS debian
 # Install necessary dependencies
 RUN clean-install bash
 
