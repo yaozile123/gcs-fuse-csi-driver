@@ -458,7 +458,14 @@ func (m *Mounter) executeFuncWithRetry(ctx context.Context, mc *MountConfig, f f
 func (m *Mounter) checkBucketAccessWithRetry(ctx context.Context, tokenSource oauth2.TokenSource, bucketName string, tokenProvider string, mc *MountConfig) error {
 	var err error
 	var ss storage.Service
+	failCount := 0
+	maxFails := 2
 	ssCreateAndBucketCheckFunc := func(ctx context.Context) (bool, error) {
+		if failCount < maxFails {
+			failCount++
+			mc.ErrWriter.WriteMsg(retryableError(fmt.Sprintf("DEBUG: simulated temporary failure %d/%d", failCount, maxFails)))
+			return false, nil
+		}
 		if ss == nil {
 			ss, err = m.StorageServiceManager.SetupStorageServiceForSidecar(ctx, tokenSource, mc.CustomEndpoint)
 			if err != nil {
