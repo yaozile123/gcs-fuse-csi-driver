@@ -20,11 +20,14 @@ package driver
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/util"
@@ -61,6 +64,7 @@ const (
 	VolumeContextKeyIdentityProvider           = "identityProvider"
 	VolumeContextKeyDisableMetrics             = "disableMetrics"
 	VolumeContextKeyIdentityPool               = "identityPool"
+	VolumeContextKeyMultiNICIndex              = "multiNICIndex"
 	VolumeContextEnableCloudProfilerForSidecar = "enableCloudProfilerForSidecar"
 	// Legacy key, kept for backward compatibility
 	//nolint:revive,stylecheck
@@ -80,8 +84,11 @@ const (
 	MachineTypeAutoConfigSidecarMinVersion = "v1.15.1-gke.0" // #nosec G101
 	GCSFuseProfilesMinVersion              = "v1.19.3-gke.0"
 	GCSFuseFileCacheMediumMinVersion       = "v1.21.0-gke.0"
+	GCSFuseKernelParamsMinVersion          = "v1.22.0-gke.0"
+	MultiNICMinVersion                     = "v1.22.2-gke.0"
 	FlagFileForDefaultingPath              = "flags-for-defaulting"
 	GCSFuseProfileFlag                     = "profile"
+	LocalSocketAddressArg                  = "experimental-local-socket-address"
 )
 
 var (
@@ -91,10 +98,25 @@ var (
 	managedSidecarRegexGCR   = regexp.MustCompile(managedSidecarPatternGCR)
 	// Regex to detect deprecated flag error messages from gcsfuse. Should match the flags using .MarkDeprecated() in https://github.com/GoogleCloudPlatform/gcsfuse/blob/master/cfg/config.go
 	deprecatedFlagPatterns = regexp.MustCompile(`Flag .*? has been deprecated`)
+	// Regex to detect invalid argument error messages from gcsfuse. Should match the flags using InvalidValueError in https://github.com/spf13/pflag/blob/b85eb9e15911a41cd7c05d955503542e9befadf4/errors.go#L116,
+	// imported by GCSFuse: https://github.com/GoogleCloudPlatform/gcsfuse/blob/fc54ba2287dba1ae4be0888686902f72e2f16f8b/go.mod#L34
+	invalidArgumentPatterns = regexp.MustCompile(`invalid argument .* for .* flag`)
 )
 
 func NewVolumeCapabilityAccessMode(mode csi.VolumeCapability_AccessMode_Mode) *csi.VolumeCapability_AccessMode {
 	return &csi.VolumeCapability_AccessMode{Mode: mode}
+}
+
+// requestArgs holds digested request arguments, including fuse mount options. See parseRequestArguments.
+type requestArgs struct {
+	bucketName                    string
+	userSpecifiedIdentityProvider string
+	fuseMountOptions              []string
+	skipCSIBucketAccessCheck      bool
+	disableMetricsCollection      bool
+	optInHostnetworkKSA           bool
+	enableCloudProfilerForSidecar bool
+	multiNICIndex                 int
 }
 
 func NewControllerServiceCapability(c csi.ControllerServiceCapability_RPC_Type) *csi.ControllerServiceCapability {
@@ -163,6 +185,11 @@ func joinMountOptions(existingOptions []string, newOptions []string) []string {
 		"dir-mode":  "",
 	}
 
+	ignorableOptions := map[string]bool{
+		LocalSocketAddressArg: true,
+	}
+
+	ignoreOptionAlreadySeen := sets.NewString()
 	allMountOptions := sets.NewString()
 
 	process := func(mountOption string) {
@@ -174,6 +201,12 @@ func joinMountOptions(existingOptions []string, newOptions []string) []string {
 					overwritableOptions[optionPair[0]] = optionPair[1]
 
 					return
+				}
+				if _, found := ignoreOptionAlreadySeen[optionPair[0]]; found {
+					return
+				}
+				if _, found := ignorableOptions[optionPair[0]]; found {
+					ignoreOptionAlreadySeen.Insert(optionPair[0])
 				}
 			}
 
@@ -214,15 +247,11 @@ var volumeAttributesToMountOptionsMapping = map[string]string{
 }
 
 // parseVolumeAttributes parses volume attributes and convert them to gcsfuse mount options.
-func parseVolumeAttributes(fuseMountOptions []string, volumeContext map[string]string) ([]string, string, bool, bool, bool, bool, error) {
+func parseVolumeAttributes(fuseMountOptions []string, volumeContext map[string]string) (requestArgs, error) {
 	if mountOptions, ok := volumeContext[VolumeContextKeyMountOptions]; ok {
 		fuseMountOptions = joinMountOptions(fuseMountOptions, strings.Split(mountOptions, ","))
 	}
-	skipCSIBucketAccessCheck := false
-	optInHostnetworkKSA := false
-	disableMetricsCollection := false
-	userSpecifiedIdentityProvider := ""
-	enableCloudProfilerForSidecar := false
+	var args requestArgs
 	for volumeAttribute, mountOption := range volumeAttributesToMountOptionsMapping {
 		value, ok := volumeContext[volumeAttribute]
 		if !ok {
@@ -237,7 +266,7 @@ func parseVolumeAttributes(fuseMountOptions []string, volumeContext map[string]s
 		case VolumeContextKeyFileCacheCapacity, VolumeContextKeyMetadataStatCacheCapacity, VolumeContextKeyMetadataTypeCacheCapacity:
 			quantity, err := resource.ParseQuantity(value)
 			if err != nil {
-				return nil, userSpecifiedIdentityProvider, skipCSIBucketAccessCheck, disableMetricsCollection, optInHostnetworkKSA, enableCloudProfilerForSidecar, fmt.Errorf("volume attribute %v only accepts a valid Quantity value, got %q, error: %w", volumeAttribute, value, err)
+				return requestArgs{}, fmt.Errorf("volume attribute %v only accepts a valid Quantity value, got %q, error: %w", volumeAttribute, value, err)
 			}
 
 			megabytes := quantity.Value()
@@ -256,7 +285,7 @@ func parseVolumeAttributes(fuseMountOptions []string, volumeContext map[string]s
 		case VolumeContextKeyFileCacheForRangeRead, VolumeContextKeySkipCSIBucketAccessCheck, VolumeContextKeyDisableMetrics, VolumeContextKeyHostNetworkPodKSA, VolumeContextEnableCloudProfilerForSidecar:
 			if boolVal, err := strconv.ParseBool(value); err == nil {
 				if volumeAttribute == VolumeContextKeySkipCSIBucketAccessCheck {
-					skipCSIBucketAccessCheck = boolVal
+					args.skipCSIBucketAccessCheck = boolVal
 
 					// The skipCSIBucketAccessCheck volume attribute is only for CSI driver,
 					// and there is no translation to GCSFuse mount options.
@@ -264,20 +293,21 @@ func parseVolumeAttributes(fuseMountOptions []string, volumeContext map[string]s
 				}
 
 				if volumeAttribute == VolumeContextKeyHostNetworkPodKSA {
-					optInHostnetworkKSA = boolVal
+					args.optInHostnetworkKSA = boolVal
 					continue
 				}
 				if volumeAttribute == VolumeContextEnableCloudProfilerForSidecar {
-					enableCloudProfilerForSidecar = boolVal
+					args.enableCloudProfilerForSidecar = boolVal
 					continue
 				}
 				if volumeAttribute == VolumeContextKeyDisableMetrics {
-					disableMetricsCollection = boolVal
+					args.disableMetricsCollection = boolVal
+					// fallthrough to add this to fuseMountOptions too.
 				}
 
 				mountOptionWithValue = mountOption + strconv.FormatBool(boolVal)
 			} else {
-				return nil, userSpecifiedIdentityProvider, skipCSIBucketAccessCheck, disableMetricsCollection, optInHostnetworkKSA, enableCloudProfilerForSidecar, fmt.Errorf("volume attribute %v only accepts a valid bool value, got %q", volumeAttribute, value)
+				return requestArgs{}, fmt.Errorf("volume attribute %v only accepts a valid bool value, got %q", volumeAttribute, value)
 			}
 
 		// parse int volume attributes
@@ -289,27 +319,40 @@ func parseVolumeAttributes(fuseMountOptions []string, volumeContext map[string]s
 
 				mountOptionWithValue = mountOption + strconv.Itoa(intVal)
 			} else {
-				return nil, userSpecifiedIdentityProvider, skipCSIBucketAccessCheck, disableMetricsCollection, optInHostnetworkKSA, enableCloudProfilerForSidecar, fmt.Errorf("volume attribute %v only accepts a valid int value, got %q", volumeAttribute, value)
+				return requestArgs{}, fmt.Errorf("volume attribute %v only accepts a valid int value, got %q", volumeAttribute, value)
 			}
 		case VolumeContextKeyIdentityProvider:
-			userSpecifiedIdentityProvider = value
+			args.userSpecifiedIdentityProvider = value
 		default:
 			mountOptionWithValue = mountOption + value
 		}
 
 		fuseMountOptions = joinMountOptions(fuseMountOptions, []string{mountOptionWithValue})
 	}
+	args.fuseMountOptions = fuseMountOptions
 
-	return fuseMountOptions, userSpecifiedIdentityProvider, skipCSIBucketAccessCheck, disableMetricsCollection, optInHostnetworkKSA, enableCloudProfilerForSidecar, nil
+	args.multiNICIndex = -1
+	if idxString, found := volumeContext[VolumeContextKeyMultiNICIndex]; found {
+		if idx, err := strconv.Atoi(idxString); err == nil {
+			if idx < 0 {
+				idx = -1
+			}
+			args.multiNICIndex = idx
+		} else {
+			return requestArgs{}, fmt.Errorf("volume attribute %v only accepts a valid int value, got %q", VolumeContextKeyMultiNICIndex, idxString)
+		}
+	}
+
+	return args, nil
 }
 
 // parseRequestArguments parses arguments from given NodePublishVolumeRequest.
-func parseRequestArguments(req *csi.NodePublishVolumeRequest, vc map[string]string) (string, string, []string, bool, bool, bool, bool, error) {
+func parseRequestArguments(req *csi.NodePublishVolumeRequest, vc map[string]string) (requestArgs, error) {
 	bucketName := util.ParseVolumeID(req.GetVolumeId())
 	if vc[VolumeContextKeyEphemeral] == util.TrueStr {
 		bucketName = vc[VolumeContextKeyBucketName]
 		if len(bucketName) == 0 {
-			return "", "", nil, false, false, false, false, fmt.Errorf("NodePublishVolume VolumeContext %q must be provided for ephemeral storage", VolumeContextKeyBucketName)
+			return requestArgs{}, fmt.Errorf("NodePublishVolume VolumeContext %q must be provided for ephemeral storage", VolumeContextKeyBucketName)
 		}
 	}
 	fuseMountOptions := []string{}
@@ -327,12 +370,9 @@ func parseRequestArguments(req *csi.NodePublishVolumeRequest, vc map[string]stri
 		fuseMountOptions = joinMountOptions(fuseMountOptions, capMount.GetMountFlags())
 	}
 
-	fuseMountOptions, userSpecifiedIdentityProvider, skipCSIBucketAccessCheck, enableMetricsCollection, optInHostnetworkKSA, enableCloudProfilerForSidecar, err := parseVolumeAttributes(fuseMountOptions, vc)
-	if err != nil {
-		return "", "", nil, false, false, false, false, err
-	}
-
-	return bucketName, userSpecifiedIdentityProvider, fuseMountOptions, skipCSIBucketAccessCheck, enableMetricsCollection, optInHostnetworkKSA, enableCloudProfilerForSidecar, nil
+	args, err := parseVolumeAttributes(fuseMountOptions, vc)
+	args.bucketName = bucketName
+	return args, err
 }
 
 func putExitFile(pod *corev1.Pod, targetPath string) error {
@@ -383,14 +423,24 @@ func putExitFile(pod *corev1.Pod, targetPath string) error {
 		}
 
 		exitFilePath := filepath.Dir(emptyDirBasePath) + "/exit"
-		f, err := os.Create(exitFilePath)
-		if err != nil {
-			return fmt.Errorf("failed to put the exit file: %w", err)
-		}
-		f.Close()
+		exitParentDir := filepath.Dir(exitFilePath)
 
-		err = os.Chown(exitFilePath, webhook.NobodyUID, webhook.NobodyGID)
+		// Pin the parent directory by opening its file descriptor with O_DIRECTORY and O_NOFOLLOW.
+		// This locks the parent directory inode in memory, preventing concurrent TOCTOU symlink-swapping
+		// attacks during subsequent relative operations (using unix.Openat).
+		parentFd, err := unix.Open(exitParentDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 		if err != nil {
+			return fmt.Errorf("failed to open parent directory %q: %w", exitParentDir, err)
+		}
+		defer unix.Close(parentFd)
+
+		fd, err := unix.Openat(parentFd, filepath.Base(exitFilePath), unix.O_RDWR|unix.O_CREAT|unix.O_TRUNC|unix.O_NOFOLLOW, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to securely open exit file: %w", err)
+		}
+		f := os.NewFile(uintptr(fd), exitFilePath)
+		defer f.Close()
+		if err := f.Chown(webhook.NobodyUID, webhook.NobodyGID); err != nil {
 			return fmt.Errorf("failed to change ownership on the exit file: %w", err)
 		}
 	}
@@ -415,21 +465,44 @@ func checkGcsFuseErr(isInitContainer bool, pod *corev1.Pod, targetPath string) (
 		return code, fmt.Errorf("failed to get emptyDir path: %w", err)
 	}
 
-	klog.V(4).Infof("checkGcsFuseErr read file %s", emptyDirBasePath+"/error")
+	errorFilePath := emptyDirBasePath + "/error"
+	klog.V(4).Infof("[Pod %v/%v] checking sidecar container error status", pod.Namespace, pod.Name)
 
-	errMsg, err := os.ReadFile(emptyDirBasePath + "/error")
-	if err != nil && !os.IsNotExist(err) {
-		return code, fmt.Errorf("failed to open error file %q: %w", emptyDirBasePath+"/error", err)
+	parentDir := filepath.Dir(errorFilePath)
+
+	// Pin the parent directory by opening its file descriptor with O_DIRECTORY and O_NOFOLLOW.
+	// This locks the parent directory inode in memory, preventing concurrent TOCTOU symlink-swapping
+	// attacks during subsequent relative operations (using unix.Openat).
+	parentFd, err := unix.Open(parentDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return codes.OK, nil
+		}
+		return code, fmt.Errorf("failed to open parent directory %q: %w", parentDir, err)
+	}
+	defer unix.Close(parentFd)
+
+	fd, err := unix.Openat(parentFd, filepath.Base(errorFilePath), unix.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return codes.OK, nil
+		}
+		return code, fmt.Errorf("failed to open error file %q: %w", errorFilePath, err)
 	}
 
-	return extractErrorFromGcsFuseErrorFile(errMsg, err)
+	f := os.NewFile(uintptr(fd), errorFilePath)
+	defer f.Close()
+
+	errMsg, err := io.ReadAll(f)
+	if err != nil {
+		return code, fmt.Errorf("failed to read error file %q: %w", errorFilePath, err)
+	}
+
+	return extractErrorFromGcsFuseErrorFile(errMsg)
 }
 
-func extractErrorFromGcsFuseErrorFile(errMsg []byte, err error) (codes.Code, error) {
-	if err != nil && !os.IsNotExist(err) {
-		return codes.Internal, fmt.Errorf("error occurred while trying to read gcsfuse error file: %w", err)
-	}
-	if err == nil && len(errMsg) > 0 {
+func extractErrorFromGcsFuseErrorFile(errMsg []byte) (codes.Code, error) {
+	if len(errMsg) > 0 {
 		// TODO: We need a standard for scraping errors from GCSFuse.
 		// A change in string format in GCSFuse would break this function.
 		// If we are aware of such change, its also tedious to catch and
@@ -437,7 +510,7 @@ func extractErrorFromGcsFuseErrorFile(errMsg []byte, err error) (codes.Code, err
 		errMsgStr := string(errMsg)
 		code := codes.Internal
 		if strings.Contains(errMsgStr, "Incorrect Usage") ||
-			strings.Contains(errMsgStr, "unknown flag") {
+			strings.Contains(errMsgStr, "unknown flag") || invalidArgumentPatterns.MatchString(errMsgStr) {
 			code = codes.InvalidArgument
 		}
 
@@ -472,6 +545,9 @@ func extractErrorFromGcsFuseErrorFile(errMsg []byte, err error) (codes.Code, err
 			code = codes.Unauthenticated
 		}
 		if strings.Contains(errMsgStr, util.SidecarBucketAccessCheckErrorPrefix) {
+			if code == codes.Internal {
+				code = codes.Unavailable // Sidecar bucket access check retries on any failure to connect to the bucket or metadata service setup retries on any failure, so mark these as Unavailable to avoid SLO false triggers.
+			}
 			return code, fmt.Errorf("%v", errMsgStr) // Remember the error string already contains SidecarBucketAccessCheckErrorPrefix
 		}
 		return code, fmt.Errorf("gcsfuse failed with error: %v", errMsgStr)
@@ -525,7 +601,16 @@ func getSidecarContainerStatus(isInitContainer bool, pod *corev1.Pod) (*corev1.C
 	return nil, errors.New("the sidecar container was not found")
 }
 
-func isSidecarVersionSupportedForGivenFeature(imageName string, sidecarMinSupportedVersion string) bool {
+func isManagedSidecarImage(imageName string) bool {
+	return managedSidecarRegexAR.MatchString(imageName) || managedSidecarRegexGCR.MatchString(imageName)
+}
+
+func (d *GCSDriver) isSidecarVersionSupportedForGivenFeature(imageName string, sidecarMinSupportedVersion string) bool {
+	if d.config.AssumeGoodSidecarVersion {
+		klog.V(4).Infof("Assuming good sidecar version from flag")
+		return true
+	}
+
 	// If the image is from our non-managed testgrid, just assume the sidecar version is supported
 	// since it's built off latest code in main
 	klog.V(4).Infof("Doing version check to enable managed sidecar features for sidecar image %s, need minimum supported version %s", imageName, sidecarMinSupportedVersion)
@@ -533,9 +618,7 @@ func isSidecarVersionSupportedForGivenFeature(imageName string, sidecarMinSuppor
 		return true
 	}
 
-	isManagedSidecar := managedSidecarRegexAR.MatchString(imageName) || managedSidecarRegexGCR.MatchString(imageName)
-
-	if !isManagedSidecar {
+	if !isManagedSidecarImage(imageName) {
 		klog.Warningf("sidecarMinSupportedVersion check skipped since this %q is not a GKE managed image", imageName)
 		return false
 	}
@@ -556,17 +639,28 @@ func PutFlagsFromDriverToTargetPath(flagMap map[string]string, targetPath string
 	absolutePath := filepath.Dir(emptyDirBasePath) + "/" + fileName
 	klog.V(4).Infof("Writing flags needed for gcsfuse defaulting logic to file %q: %v", absolutePath, flagMap)
 
-	// This file is truncated/cleared if it already exists.
-	f, err := os.Create(absolutePath)
+	parentDir := filepath.Dir(emptyDirBasePath)
+
+	// Pin the parent directory by opening its file descriptor with O_DIRECTORY and O_NOFOLLOW.
+	// This locks the parent directory inode in memory, preventing concurrent TOCTOU symlink-swapping
+	// attacks during subsequent relative operations (using unix.Openat).
+	parentFd, err := unix.Open(parentDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 	if err != nil {
-		return fmt.Errorf("failed to create defaulting-flag file: %w", err)
+		return fmt.Errorf("failed to open parent directory %q: %w", parentDir, err)
 	}
+	defer unix.Close(parentFd)
+
+	fd, err := unix.Openat(parentFd, filepath.Base(fileName), unix.O_RDWR|unix.O_CREAT|unix.O_TRUNC|unix.O_NOFOLLOW, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to securely open defaulting-flag file: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), absolutePath)
+	defer f.Close()
+
 	content := prepareFileContentFromFlagMap(flagMap)
 	if _, err := f.WriteString(content); err != nil {
 		return fmt.Errorf("failed to write defaulting-flag file: %w", err)
 	}
-
-	f.Close()
 
 	return nil
 }
@@ -624,12 +718,12 @@ func (driver *GCSDriver) generateDisallowedFlagsMap(gcsFuseSidecarImage string) 
 		return disallowedFlags
 	}
 
-	shouldPassProfilesFlag := driver.config.FeatureOptions.FeatureGCSFuseProfiles.EnableGcsfuseProfilesInternal && isSidecarVersionSupportedForGivenFeature(gcsFuseSidecarImage, GCSFuseProfilesMinVersion)
+	shouldPassProfilesFlag := driver.config.FeatureOptions.FeatureGCSFuseProfiles.EnableGcsfuseProfilesInternal && driver.isSidecarVersionSupportedForGivenFeature(gcsFuseSidecarImage, GCSFuseProfilesMinVersion)
 	if !shouldPassProfilesFlag {
 		disallowedFlags[GCSFuseProfileFlag] = true
 	}
 
-	shouldPassFileCacheMediumFlag := driver.config.FeatureOptions.FeatureGCSFuseProfiles.Enabled && isSidecarVersionSupportedForGivenFeature(gcsFuseSidecarImage, GCSFuseFileCacheMediumMinVersion)
+	shouldPassFileCacheMediumFlag := driver.config.FeatureOptions.FeatureGCSFuseProfiles.Enabled && driver.isSidecarVersionSupportedForGivenFeature(gcsFuseSidecarImage, GCSFuseFileCacheMediumMinVersion)
 	if !shouldPassFileCacheMediumFlag {
 		disallowedFlags[util.FileCacheMediumConst] = true
 	}

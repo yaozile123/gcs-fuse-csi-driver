@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/util"
 	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/webhook"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -40,13 +41,16 @@ import (
 )
 
 type Interface interface {
+	K8sClient() kubernetes.Interface
 	ConfigurePodLister(ctx context.Context, nodeName string)
 	ConfigureNodeLister(ctx context.Context, nodeName string)
 	ConfigurePVLister(ctx context.Context)
+	ConfigurePVCLister(ctx context.Context)
 	ConfigureSCLister(ctx context.Context)
 	GetPod(namespace, name string) (*corev1.Pod, error)
 	GetNode(name string) (*corev1.Node, error)
 	GetPV(name string) (*corev1.PersistentVolume, error)
+	GetPVC(namespace string, name string) (*corev1.PersistentVolumeClaim, error)
 	GetSC(name string) (*storagev1.StorageClass, error)
 	CreateServiceAccountToken(ctx context.Context, namespace, name string, tokenRequest *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error)
 	GetGCPServiceAccountName(ctx context.Context, namespace, name string) (string, error)
@@ -62,8 +66,10 @@ type Clientset struct {
 	podLister                 listersv1.PodLister
 	nodeLister                listersv1.NodeLister
 	pvLister                  listersv1.PersistentVolumeLister
+	pvcLister                 listersv1.PersistentVolumeClaimLister
 	scLister                  storagelisters.StorageClassLister
 	informerResyncDurationSec int
+	runController             bool
 }
 
 const (
@@ -71,6 +77,10 @@ const (
 	MachineTypeKey                    = "node.kubernetes.io/instance-type"
 	GkeAppliedNodeLabelsAnnotationKey = "node.gke.io/last-applied-node-labels"
 )
+
+func (c *Clientset) K8sClient() kubernetes.Interface {
+	return c.k8sClients
+}
 
 func (c *Clientset) ConfigureNodeLister(ctx context.Context, nodeName string) {
 	trim := func(obj interface{}) (interface{}, error) {
@@ -140,7 +150,7 @@ func (c *Clientset) ConfigureNodeLister(ctx context.Context, nodeName string) {
 func (c *Clientset) ConfigurePVLister(ctx context.Context) {
 	trim := func(obj any) (any, error) {
 		pvObj, ok := obj.(*corev1.PersistentVolume)
-		if !ok {
+		if !ok || pvObj == nil {
 			return obj, nil
 		}
 		return &corev1.PersistentVolume{
@@ -149,7 +159,44 @@ func (c *Clientset) ConfigurePVLister(ctx context.Context) {
 				Annotations: pvObj.ObjectMeta.Annotations, // Required by the gcsfuse profiles feature to calculate smart cache recommendations.
 			},
 			Spec: corev1.PersistentVolumeSpec{
-				StorageClassName: pvObj.Spec.StorageClassName, // Required by the gcsfuse profiles feature to map PV to SC.
+				StorageClassName: pvObj.Spec.StorageClassName,
+			},
+		}, nil
+	}
+
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(
+		c.k8sClients,
+		time.Duration(c.informerResyncDurationSec)*time.Second,
+		// To prevent OOMs, the Node driver uses a server-side filter to cache only profile-managed PVs since profiles is the only feature using GetPV.
+		// Leaving the Controller unfiltered to discover and patch legacy volumes.
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			if !c.runController {
+				options.LabelSelector = fmt.Sprintf("%s=%s", webhook.GcsfuseProfilesManagedLabel, util.TrueStr)
+			}
+		}),
+		informers.WithTransform(trim),
+	)
+	pvLister := informerFactory.Core().V1().PersistentVolumes().Lister()
+
+	informerFactory.Start(ctx.Done())
+	informerFactory.WaitForCacheSync(ctx.Done())
+
+	c.pvLister = pvLister
+}
+
+func (c *Clientset) ConfigurePVCLister(ctx context.Context) {
+	trim := func(obj any) (any, error) {
+		pvcObj, ok := obj.(*corev1.PersistentVolumeClaim)
+		if !ok {
+			return obj, nil
+		}
+		return &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      pvcObj.ObjectMeta.Name,
+				Namespace: pvcObj.ObjectMeta.Namespace,
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				VolumeName: pvcObj.Spec.VolumeName,
 			},
 		}, nil
 	}
@@ -159,12 +206,13 @@ func (c *Clientset) ConfigurePVLister(ctx context.Context) {
 		time.Duration(c.informerResyncDurationSec)*time.Second,
 		informers.WithTransform(trim),
 	)
-	pvLister := informerFactory.Core().V1().PersistentVolumes().Lister()
+
+	pvcLister := informerFactory.Core().V1().PersistentVolumeClaims().Lister()
 
 	informerFactory.Start(ctx.Done())
 	informerFactory.WaitForCacheSync(ctx.Done())
 
-	c.pvLister = pvLister
+	c.pvcLister = pvcLister
 }
 
 func (c *Clientset) ConfigureSCLister(ctx context.Context) {
@@ -196,7 +244,7 @@ func (c *Clientset) ConfigureSCLister(ctx context.Context) {
 	c.scLister = scLister
 }
 
-func New(kubeconfigPath string, informerResyncDurationSec int) (Interface, error) {
+func New(kubeconfigPath string, informerResyncDurationSec int, runController bool) (Interface, error) {
 	var err error
 	var rc *rest.Config
 	if kubeconfigPath != "" {
@@ -216,7 +264,7 @@ func New(kubeconfigPath string, informerResyncDurationSec int) (Interface, error
 		return nil, fmt.Errorf("failed to configure k8s client: %w", err)
 	}
 
-	return &Clientset{k8sClients: clientset, informerResyncDurationSec: informerResyncDurationSec}, nil
+	return &Clientset{k8sClients: clientset, informerResyncDurationSec: informerResyncDurationSec, runController: runController}, nil
 }
 
 func (c *Clientset) ConfigurePodLister(ctx context.Context, nodeName string) {
@@ -308,12 +356,26 @@ func (c *Clientset) GetNode(name string) (*corev1.Node, error) {
 	return c.nodeLister.Get(name)
 }
 
+// GetPV retrieves a PersistentVolume from the informer cache by name.
+// IMPORTANT: In the Node driver, the PV informer cache is intentionally filtered down
+// to ONLY track PVs that utilize the GCS Fuse profiles feature (via the gke-gcsfuse/profile-managed label)
+// to minimize the memory footprint in large-scale clusters.
+// Do not attempt to use this function from the Node driver to look up generic PVs or non-profile GCS Fuse PVs,
+// as they are explicitly prevented from entering the Node's cache.
 func (c *Clientset) GetPV(name string) (*corev1.PersistentVolume, error) {
 	if c.pvLister == nil {
 		return nil, errors.New("pv informer is not ready")
 	}
 
 	return c.pvLister.Get(name)
+}
+
+func (c *Clientset) GetPVC(namespace, name string) (*corev1.PersistentVolumeClaim, error) {
+	if c.pvcLister == nil {
+		return nil, errors.New("pvc informer is not ready")
+	}
+
+	return c.pvcLister.PersistentVolumeClaims(namespace).Get(name)
 }
 
 func (c *Clientset) GetSC(name string) (*storagev1.StorageClass, error) {

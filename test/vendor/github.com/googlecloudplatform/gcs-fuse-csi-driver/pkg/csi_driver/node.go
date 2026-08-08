@@ -35,14 +35,30 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	mount "k8s.io/mount-utils"
 )
 
 const (
 	UmountTimeout = time.Second * 5
-
-	FuseMountType = "fuse"
+	// GCSFuseKernelParamsFilePollInterval is the interval at which the GCSFuse kernel
+	// parameters file is polled and any changes to kernel parameter files are applied.
+	GCSFuseKernelParamsFilePollInterval = time.Second * 5
+	FuseMountType                       = "fuse"
+	maxGCSFuseVolumesForMetrics         = 10
+	unmountRetryInterval                = 100 * time.Millisecond
+	unmountRetryBackoffFactor           = 2.0
+	unmountRetryJitter                  = 0.1
+	// Standard unmount has no built-in timeout, so we use a short timeout to fail fast.
+	standardUnmountRetryTimeout = 2 * time.Second
+	standardUnmountRetrySteps   = 5
+	// Force unmount attempts include an initial non-force unmount with a
+	// 5 second timeout (as defined in vendor/k8s.io/mount-utils/mount_linux.go).
+	// We then retry force unmounting for 2 seconds.
+	// Thus the full timeout is 7 seconds.
+	forceUnmountRetryTimeout = 7 * time.Second
+	forceUnmountRetrySteps   = 6
 )
 
 // nodeServer handles mounting and unmounting of GCS FUSE volumes on a node.
@@ -51,6 +67,7 @@ type nodeServer struct {
 	driver                *GCSDriver
 	storageServiceManager storage.ServiceManager
 	mounter               mount.Interface
+	nwMgr                 NetworkManager
 	volumeLocks           *util.VolumeLocks
 	k8sClients            clientset.Interface
 	limiter               rate.Limiter
@@ -62,6 +79,7 @@ func newNodeServer(driver *GCSDriver, mounter mount.Interface) csi.NodeServer {
 		driver:                driver,
 		storageServiceManager: driver.config.StorageServiceManager,
 		mounter:               mounter,
+		nwMgr:                 driver.config.NetworkManager,
 		volumeLocks:           util.NewVolumeLocks(),
 		k8sClients:            driver.config.K8sClients,
 		limiter:               *rate.NewLimiter(rate.Every(time.Second), 10),
@@ -126,11 +144,11 @@ func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	}
 
 	// Validate arguments
-	bucketName, userSpecifiedIdentityProvider, fuseMountOptions, skipBucketAccessCheck, disableMetricsCollection, optInHostnetworkKSA, enableCloudProfilerForSidecar, err := parseRequestArguments(req, vc)
+	args, err := parseRequestArguments(req, vc)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	klog.V(6).Infof("NodePublishVolume on volume %q has skipBucketAccessCheck %t", bucketName, skipBucketAccessCheck)
+	klog.V(6).Infof("NodePublishVolume on volume %q has skipBucketAccessCheck %t", args.bucketName, args.skipCSIBucketAccessCheck)
 
 	if err := s.driver.validateVolumeCapabilities([]*csi.VolumeCapability{req.GetVolumeCapability()}); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -142,18 +160,23 @@ func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	}
 	defer s.volumeLocks.Release(targetPath)
 
-	// Check if the given Service Account has the access to the GCS bucket, and the bucket exists.
-	// skip check if it has ever succeeded
-	if bucketName != "_" && !skipBucketAccessCheck {
-		// Use target path as an volume identifier because it corresponds to Pods and volumes.
-		// Pods may belong to different namespaces and would need their own access check.
-		vs, ok := s.volumeStateStore.Load(targetPath)
-		if !ok {
+	// Use target path as an volume identifier because it corresponds to Pods and volumes.
+	// Pods may belong to different namespaces and would need their own bucket access check.
+	// We initialize volumeState iff bucket name is NOT "_", I.e. It's not a dynamic mount.
+	var vs *util.VolumeState
+	if args.bucketName != "_" {
+		var ok bool
+		if vs, ok = s.volumeStateStore.Load(targetPath); !ok {
 			s.volumeStateStore.Store(targetPath, &util.VolumeState{})
 			vs, _ = s.volumeStateStore.Load(targetPath)
 		}
-		// volumeState is safe to access for remaining of function since volumeLock prevents
-		// Node Publish/Unpublish Volume calls from running more than once at a time per volume.
+	}
+	// volumeState is safe to access if its not nil for remaining of function since volumeLock prevents
+	// Node Publish/Unpublish Volume calls from running more than once at a time per volume.
+
+	// Check if the given Service Account has the access to the GCS bucket, and the bucket exists.
+	// skip check if it has ever succeeded
+	if vs != nil && !args.skipCSIBucketAccessCheck {
 		if !vs.BucketAccessCheckPassed {
 			storageService, err := s.prepareStorageService(ctx, vc)
 			if err != nil {
@@ -161,45 +184,45 @@ func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 			}
 			defer storageService.Close()
 
-			if exist, err := storageService.CheckBucketExists(ctx, &storage.ServiceBucket{Name: bucketName}); !exist {
-				return nil, status.Errorf(storage.ParseErrCode(err), "failed to get GCS bucket %q: %v", bucketName, err)
+			if exist, err := storageService.CheckBucketExists(ctx, &storage.ServiceBucket{Name: args.bucketName}); !exist {
+				return nil, status.Errorf(storage.ParseErrCode(err), "failed to get GCS bucket %q: %v", args.bucketName, err)
 			}
 
 			vs.BucketAccessCheckPassed = true
 		}
 	}
 
-	enableSidecarBucketAccessCheckForSidecarVersion := s.driver.config.EnableSidecarBucketAccessCheck && gcsFuseSidecarImage != "" && isSidecarVersionSupportedForGivenFeature(gcsFuseSidecarImage, SidecarBucketAccessCheckMinVersion)
+	enableSidecarBucketAccessCheckForSidecarVersion := s.driver.config.EnableSidecarBucketAccessCheck && gcsFuseSidecarImage != "" && s.driver.isSidecarVersionSupportedForGivenFeature(gcsFuseSidecarImage, SidecarBucketAccessCheckMinVersion)
 	identityProvider := ""
-	if s.shouldPopulateIdentityProvider(pod, optInHostnetworkKSA, userSpecifiedIdentityProvider != "") {
-		if userSpecifiedIdentityProvider != "" {
-			identityProvider = userSpecifiedIdentityProvider
+	if s.shouldPopulateIdentityProvider(pod, args.optInHostnetworkKSA, args.userSpecifiedIdentityProvider != "") {
+		if args.userSpecifiedIdentityProvider != "" {
+			identityProvider = args.userSpecifiedIdentityProvider
 		} else {
 			identityProvider = s.driver.config.TokenManager.GetIdentityProvider()
 		}
 		klog.V(6).Infof("NodePublishVolume populating identity provider %q in mount options", identityProvider)
-		fuseMountOptions = joinMountOptions(fuseMountOptions, []string{util.OptInHnw + "=true", util.TokenServerIdentityProviderConst + "=" + identityProvider})
+		args.fuseMountOptions = joinMountOptions(args.fuseMountOptions, []string{util.OptInHnw + "=true", util.TokenServerIdentityProviderConst + "=" + identityProvider})
 	} else if enableSidecarBucketAccessCheckForSidecarVersion {
 		//Enable sidecar bucket access check only for Workload Identity workloads. This feature consumes additional quota for Host Network pods as we do not have token caching.
-		fuseMountOptions = joinMountOptions(fuseMountOptions, []string{util.EnableSidecarBucketAccessCheckConst + "=" + strconv.FormatBool(s.driver.config.EnableSidecarBucketAccessCheck)})
+		args.fuseMountOptions = joinMountOptions(args.fuseMountOptions, []string{util.EnableSidecarBucketAccessCheckConst + "=" + strconv.FormatBool(s.driver.config.EnableSidecarBucketAccessCheck)})
 	}
 
 	if enableSidecarBucketAccessCheckForSidecarVersion {
 		if identityProvider == "" {
 			identityProvider = s.driver.config.TokenManager.GetIdentityProvider()
-			fuseMountOptions = joinMountOptions(fuseMountOptions, []string{util.TokenServerIdentityProviderConst + "=" + identityProvider})
+			args.fuseMountOptions = joinMountOptions(args.fuseMountOptions, []string{util.TokenServerIdentityProviderConst + "=" + identityProvider})
 		}
 		klog.Infof("Got identity provider %s", identityProvider)
 
 		identityPool := s.driver.config.TokenManager.GetIdentityPool()
-		fuseMountOptions = joinMountOptions(fuseMountOptions, []string{
+		args.fuseMountOptions = joinMountOptions(args.fuseMountOptions, []string{
 			util.PodNamespaceConst + "=" + vc[VolumeContextKeyPodNamespace],
 			util.ServiceAccountNameConst + "=" + vc[VolumeContextKeyServiceAccountName],
 			util.TokenServerIdentityPoolConst + "=" + identityPool})
 	}
 
-	if enableCloudProfilerForSidecar && gcsFuseSidecarImage != "" && isSidecarVersionSupportedForGivenFeature(gcsFuseSidecarImage, SidecarCloudProfilerMinVersion) {
-		fuseMountOptions = joinMountOptions(fuseMountOptions, []string{util.EnableCloudProfilerForSidecarConst + "=" + strconv.FormatBool(enableCloudProfilerForSidecar)})
+	if args.enableCloudProfilerForSidecar && gcsFuseSidecarImage != "" && s.driver.isSidecarVersionSupportedForGivenFeature(gcsFuseSidecarImage, SidecarCloudProfilerMinVersion) {
+		args.fuseMountOptions = joinMountOptions(args.fuseMountOptions, []string{util.EnableCloudProfilerForSidecarConst + "=" + strconv.FormatBool(args.enableCloudProfilerForSidecar)})
 	}
 
 	node, err := s.k8sClients.GetNode(s.driver.config.NodeID)
@@ -229,9 +252,17 @@ func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 
 	// Register metrics collector.
 	// It is idempotent to register the same collector in node republish calls.
-	if s.driver.config.MetricsManager != nil && !disableMetricsCollection {
-		klog.V(6).Infof("NodePublishVolume enabling metrics collector for target path %q", targetPath)
-		s.driver.config.MetricsManager.RegisterMetricsCollector(targetPath, pod.Namespace, pod.Name, bucketName)
+	if s.driver.config.MetricsManager != nil && !args.disableMetricsCollection {
+		gcsFuseVolumeCount, err := s.countGcsFuseVolumes(pod)
+
+		if err != nil {
+			klog.Errorf("Metrics collection is disabled for Pod %s/%s as counting the number of GCS FUSE volumes failed with error: %v", pod.Namespace, pod.Name, err)
+		} else if gcsFuseVolumeCount > maxGCSFuseVolumesForMetrics {
+			klog.Warningf("Metrics collection is disabled for Pod %s/%s as the number of GCS FUSE volumes is %d, which is greater than the limit of %d.", pod.Namespace, pod.Name, gcsFuseVolumeCount, maxGCSFuseVolumesForMetrics)
+		} else {
+			klog.V(4).Infof("NodePublishVolume enabling metrics collector for target path %q", targetPath)
+			s.driver.config.MetricsManager.RegisterMetricsCollector(targetPath, pod.Namespace, pod.Name, args.bucketName, s.driver.config.NodeID)
+		}
 	}
 
 	// Check if the sidecar container is still required,
@@ -244,7 +275,7 @@ func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	}
 
 	// Only pass mountOptions flags for defaulting if sidecar container is managed and satisifies min version requirement
-	if gcsFuseSidecarImage != "" && isSidecarVersionSupportedForGivenFeature(gcsFuseSidecarImage, MachineTypeAutoConfigSidecarMinVersion) {
+	if gcsFuseSidecarImage != "" && s.driver.isSidecarVersionSupportedForGivenFeature(gcsFuseSidecarImage, MachineTypeAutoConfigSidecarMinVersion) {
 		shouldDisableAutoConfig := s.driver.config.DisableAutoconfig
 		machineType, ok := node.Labels[clientset.MachineTypeKey]
 		if ok {
@@ -272,7 +303,7 @@ func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 		code, err := checkGcsFuseErr(isInitContainer, pod, targetPath)
 		if code != codes.OK {
 			if code == codes.Canceled {
-				klog.V(4).Infof("NodePublishVolume on volume %q to target path %q is not needed because the gcsfuse has terminated.", bucketName, targetPath)
+				klog.V(4).Infof("NodePublishVolume on volume %q to target path %q is not needed because the gcsfuse has terminated.", args.bucketName, targetPath)
 
 				return &csi.NodePublishVolumeResponse{}, nil
 			}
@@ -288,9 +319,18 @@ func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 
 		// TODO: Check if the socket listener timed out
 
-		klog.V(4).Infof("NodePublishVolume succeeded on volume %q to target path %q, mount already exists.", bucketName, targetPath)
+		// Restart monitoring goroutine if the driver restarts for existing mounts.
+		s.startGcsFuseKernelParamsMonitoring(targetPath, gcsFuseSidecarImage, vs)
+
+		klog.V(4).Infof("NodePublishVolume succeeded on volume %q to target path %q, mount already exists.", args.bucketName, targetPath)
 
 		return &csi.NodePublishVolumeResponse{}, nil
+	}
+
+	// Unlike other features, we'll assume multi NIC can be used unless we know for certain we have a version mismatch.
+	canUseMultiNIC := !isManagedSidecarImage(gcsFuseSidecarImage) || s.driver.isSidecarVersionSupportedForGivenFeature(gcsFuseSidecarImage, MultiNICMinVersion)
+	if err := s.setupMultiNIC(&args, pod, canUseMultiNIC); err != nil {
+		return nil, err
 	}
 
 	klog.V(4).Infof("NodePublishVolume attempting mkdir for path %q", targetPath)
@@ -301,25 +341,57 @@ func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	if profilesEnabled && profile != nil {
 		// Merge the recommended mount options with user's mount options if the profiles feature
 		// is enabled. This operation respects the user's mount options if they are duplicated.
-		fuseMountOptions, err = profile.MergeRecommendedMountOptionsOnMissingKeys(fuseMountOptions)
+		args.fuseMountOptions, err = profile.MergeRecommendedMountOptionsOnMissingKeys(args.fuseMountOptions)
 		if err != nil {
 			return nil, fmt.Errorf("failed to recommend mount options: %w", err)
 		}
 	}
 
-	disallowedFlags := s.driver.generateDisallowedFlagsMap(gcsFuseSidecarImage)
-	fuseMountOptions = removeDisallowedMountOptions(fuseMountOptions, disallowedFlags)
-	// Start to mount
-	if err = s.mounter.Mount(bucketName, targetPath, FuseMountType, fuseMountOptions); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to mount volume %q to target path %q: %v", bucketName, targetPath, err)
+	// Pass kernel params file flag to GCSFuse iff GCSFuse Kernel Params feature is supported.
+	if s.isGcsFuseKernelParamsFeatureSupported(gcsFuseSidecarImage, vs) {
+		// Note: enable-gcsfuse-kernel-params *must* be delimeted with an "=" sign, since it's an internal CSI flag.
+		args.fuseMountOptions = joinMountOptions(args.fuseMountOptions, []string{util.EnableGCSFuseKernelParams + "=true"})
 	}
 
-	klog.V(4).Infof("NodePublishVolume succeeded on volume %q to target path %q", bucketName, targetPath)
+	disallowedFlags := s.driver.generateDisallowedFlagsMap(gcsFuseSidecarImage)
+	args.fuseMountOptions = removeDisallowedMountOptions(args.fuseMountOptions, disallowedFlags)
+	// Start to mount
+	if err = s.mounter.Mount(args.bucketName, targetPath, FuseMountType, args.fuseMountOptions); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to mount volume %q to target path %q: %v", args.bucketName, targetPath, err)
+	}
+
+	// Start monitoring goroutine for new mounts.
+	s.startGcsFuseKernelParamsMonitoring(targetPath, gcsFuseSidecarImage, vs)
+	klog.V(4).Infof("NodePublishVolume succeeded on volume %q to target path %q", args.bucketName, targetPath)
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func (s *nodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+// startGcsFuseKernelParamsMonitoring starts a single long lived goroutine to monitor the
+// GCSFuse kernel parameters file per target path if the feature is enabled and supported.
+// It uses sync.Once to ensure the monitor is started only once. This monitoring goroutine is
+// stopped in the NodeUnpublishVolume operation.
+func (s *nodeServer) startGcsFuseKernelParamsMonitoring(targetPath, gcsFuseSidecarImage string, vs *util.VolumeState) {
+	if s.isGcsFuseKernelParamsFeatureSupported(gcsFuseSidecarImage, vs) {
+		vs.GCSFuseKernelMonitorState.StartKernelParamsFileMonitorOnce.Do(func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			vs.GCSFuseKernelMonitorState.CancelFunc = cancel
+			// Fire kernel params monitoring goroutine.
+			go util.MonitorKernelParamsFile(ctx, targetPath, GCSFuseKernelParamsFilePollInterval)
+		})
+	}
+}
+
+// isGcsFuseKernelParamsFeatureSupported returns true if the GCSFuse kernel parameters feature is enabled and supported by sidecar version.
+// GCSFuse KernelParams Feature is not supported when volumeState is nil meaning it's Dynamic mount.
+func (s *nodeServer) isGcsFuseKernelParamsFeatureSupported(gcsFuseSidecarImage string, vs *util.VolumeState) bool {
+	return vs != nil &&
+		s.driver.config.FeatureOptions.EnableGCSFuseKernelParams &&
+		gcsFuseSidecarImage != "" &&
+		s.driver.isSidecarVersionSupportedForGivenFeature(gcsFuseSidecarImage, GCSFuseKernelParamsMinVersion)
+}
+
+func (s *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	// Validate arguments
 	targetPath := req.GetTargetPath()
 	if len(targetPath) == 0 {
@@ -335,10 +407,16 @@ func (s *nodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubli
 	// Unregister metrics collecter.
 	// It is idempotent to unregister the same collector.
 	if s.driver.config.MetricsManager != nil {
-		s.driver.config.MetricsManager.UnregisterMetricsCollector(targetPath)
+		s.driver.config.MetricsManager.UnregisterMetricsCollector(targetPath, s.driver.config.NodeID)
 	}
 
-	s.volumeStateStore.Delete(targetPath)
+	// Stop GCSFuse Kernel Params monitoring.
+	if vs, ok := s.volumeStateStore.Load(targetPath); ok {
+		if vs.GCSFuseKernelMonitorState.CancelFunc != nil {
+			vs.GCSFuseKernelMonitorState.CancelFunc()
+		}
+		s.volumeStateStore.Delete(targetPath)
+	}
 
 	// Check if the target path is already mounted
 	if mounted, err := s.isDirMounted(targetPath); mounted || err != nil {
@@ -350,12 +428,16 @@ func (s *nodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubli
 		// mount.CleanupMountPoint() call will hang.
 		forceUnmounter, ok := s.mounter.(mount.MounterForceUnmounter)
 		if ok {
-			if err = forceUnmounter.UnmountWithForce(targetPath, UmountTimeout); err != nil {
+			if err = s.unmountWithRetry(ctx, targetPath, forceUnmountRetryTimeout, forceUnmountRetrySteps, func() error {
+				return forceUnmounter.UnmountWithForce(targetPath, UmountTimeout)
+			}); err != nil {
 				return nil, status.Errorf(codes.Internal, "failed to force unmount target path %q: %v", targetPath, err)
 			}
 		} else {
 			klog.Warningf("failed to cast the mounter to a forceUnmounter, proceed with the default mounter Unmount")
-			if err = s.mounter.Unmount(targetPath); err != nil {
+			if err = s.unmountWithRetry(ctx, targetPath, standardUnmountRetryTimeout, standardUnmountRetrySteps, func() error {
+				return s.mounter.Unmount(targetPath)
+			}); err != nil {
 				return nil, status.Errorf(codes.Internal, "failed to unmount target path %q: %v", targetPath, err)
 			}
 		}
@@ -384,6 +466,78 @@ func (s *nodeServer) isDirMounted(targetPath string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// unmountWithRetry retries the unmount operation using exponential backoff.
+// It uses a child context with a timeout to limit the total retry duration,
+// in addition to being limited to the defined number of steps.
+//
+// If the OS unmount system call itself hangs, this function will block
+// on the hung call. It won't be able to interrupt the hung call until the Kubelet cancels the parent
+// context (NodeUnpublishVolume context) and retries the entire operation.
+func (s *nodeServer) unmountWithRetry(ctx context.Context, targetPath string, timeout time.Duration, steps int, unmountFn func() error) error {
+	var lastErr error
+	childCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	backoff := wait.Backoff{
+		Duration: unmountRetryInterval,
+		Factor:   unmountRetryBackoffFactor,
+		Jitter:   unmountRetryJitter,
+		Steps:    steps,
+	}
+
+	pollErr := wait.ExponentialBackoffWithContext(childCtx, backoff, func(ctx context.Context) (bool, error) {
+		lastErr = unmountFn()
+		if lastErr == nil {
+			return true, nil
+		}
+		klog.Warningf("Failed to unmount %q: %v. Retrying...", targetPath, lastErr)
+		return false, nil
+	})
+
+	if pollErr != nil {
+		if lastErr != nil {
+			return lastErr
+		}
+		return pollErr
+	}
+	return nil
+}
+
+// setupMultiNIC updates args with options for multi NIC configuration.
+func (s *nodeServer) setupMultiNIC(args *requestArgs, pod *corev1.Pod, sidecarSupport bool) error {
+	if args.multiNICIndex < 0 {
+		klog.V(4).Infof("No multi NIC to configure")
+		return nil
+	}
+
+	if !sidecarSupport {
+		// Error rather than silently ignore to avoid difficult performance regressions.
+		s.driver.RecordEventf(pod, corev1.EventTypeWarning, "MultiNICError", "multi NIC not supported by gcs fuse sidecar version")
+		return fmt.Errorf("multi NIC request, but not supported by gcs fuse sidecar version")
+	}
+
+	device, message, err := GetDeviceForNumaNode(s.nwMgr, args.multiNICIndex)
+	if err != nil {
+		s.driver.RecordEventf(pod, corev1.EventTypeWarning, "MultiNICIgnored", "No device found for numa index %d, ignoring multi-NIC (%s): %v", args.multiNICIndex, message, err)
+		klog.Errorf("No device found for numa index %d, ignoring: %s %v", args.multiNICIndex, message, err)
+		return nil // just ignore rather than block mount
+	}
+	klog.V(4).Infof("Multi NIC %d chose %s: %s", args.multiNICIndex, device, message)
+	source, err := AddSourceRouteForDevice(s.nwMgr, device)
+	if err != nil {
+		s.driver.RecordEventf(pod, corev1.EventTypeWarning, "MultiNICIgnored", "Not able to add source route, ignoring multi-NIC: %v", err)
+		klog.Errorf("Not able to add source route. Will ignore multi-nic configuration: %v", err)
+		return nil
+	}
+
+	args.fuseMountOptions = joinMountOptions(args.fuseMountOptions, []string{
+		fmt.Sprintf("%s=%s", LocalSocketAddressArg, source),
+		fmt.Sprintf("%s=%d", util.GCSFuseNumaNodeArg, args.multiNICIndex),
+	})
+
+	return nil
 }
 
 // prepareStorageService prepares the GCS Storage Service using the Kubernetes Service Account from VolumeContext.
@@ -420,7 +574,7 @@ func (s *nodeServer) shouldPopulateIdentityProvider(pod *corev1.Pod, optInHnwKSA
 
 	for _, container := range pod.Spec.InitContainers {
 		if container.Name == webhook.GcsFuseSidecarName {
-			sidecarVersionSupported = isSidecarVersionSupportedForGivenFeature(container.Image, TokenServerSidecarMinVersion)
+			sidecarVersionSupported = s.driver.isSidecarVersionSupportedForGivenFeature(container.Image, TokenServerSidecarMinVersion)
 
 			break
 		}
@@ -441,4 +595,36 @@ func gcsFuseSidecarContainerImage(pod *corev1.Pod) string {
 		}
 	}
 	return ""
+}
+
+// countGcsFuseVolumes returns the number of GCSFuse CSI Ephemeral volumes or
+// PersistentVolumeClaims in the given Pod spec. We intentionally do not
+// check to see if the PVC is a GCSFuseCSI PVC because that requires additional
+// API calls or a PVC informer which previously made the node driver OOM.
+// We may end up counting some non-GCSFuse volumes, but that is acceptable
+// since this is only used to determine whether to enable metrics collection
+// on a given pod.
+// TODO(amacaskill): Make sure the PVC is a GCSFuseCSI PVC, without
+// causing an OOM in the node driver at scale.
+func (s *nodeServer) countGcsFuseVolumes(pod *corev1.Pod) (int, error) {
+	gcsFuseVolumeCount := 0
+
+	if pod.Spec.Volumes == nil {
+		return gcsFuseVolumeCount, nil
+	}
+
+	for _, v := range pod.Spec.Volumes {
+		// Count ephemeral gcsfuse volumes
+		if v.CSI != nil && v.CSI.Driver == s.driver.config.Name {
+			gcsFuseVolumeCount++
+			continue
+		}
+
+		if v.PersistentVolumeClaim != nil {
+			gcsFuseVolumeCount++
+			continue
+		}
+	}
+
+	return gcsFuseVolumeCount, nil
 }
