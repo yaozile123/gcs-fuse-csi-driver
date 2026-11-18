@@ -790,7 +790,7 @@ func TestSyncPV(t *testing.T) {
 		{
 			name:           "Profiles V2 flag on and PV sets useProfilesV2 to false - Should scan as V1",
 			key:            pvName,
-			initialObjects: []runtime.Object{createPV(pvName, scName, bucketName, csiDriverName, nil, nil, map[string]string{useProfilesV2Key: "false"}), relevantSC},
+			initialObjects: []runtime.Object{createPV(pvName, scName, bucketName, csiDriverName, nil, nil, map[string]string{putil.UseProfilesV2Key: "false"}), relevantSC},
 			bucketI:        scanResult,
 			v2Flag:         true,
 			expectedAnnots: map[string]string{putil.AnnotationStatus: "completed"},
@@ -799,7 +799,7 @@ func TestSyncPV(t *testing.T) {
 		{
 			name:           "Profiles V2 flag off and PV sets useProfilesV2 to true - Should still scan as V1",
 			key:            pvName,
-			initialObjects: []runtime.Object{createPV(pvName, scName, bucketName, csiDriverName, nil, nil, map[string]string{useProfilesV2Key: "true"}), relevantSC},
+			initialObjects: []runtime.Object{createPV(pvName, scName, bucketName, csiDriverName, nil, nil, map[string]string{putil.UseProfilesV2Key: "true"}), relevantSC},
 			bucketI:        scanResult,
 			expectedAnnots: map[string]string{putil.AnnotationStatus: "completed"},
 			expectScanCall: true,
@@ -986,7 +986,7 @@ func TestSyncPod(t *testing.T) {
 		{
 			name:             "Profiles V2 flag on and Pod mixes V1 and V2 PVs, Pod requeued until the V1 PV is scanned",
 			pod:              createPod(testPodName, testNamespace, []v1.Volume{volRelevant, volV2}, podLabels, true),
-			initialObjects:   []runtime.Object{createPV(testPVName, testSCName, testBucketName, csiDriverName, nil, nil, map[string]string{useProfilesV2Key: "false"}), createPV("pv-v2", testSCName, testBucketName, csiDriverName, nil, nil, nil), scValid, pvcBoundRelevant, createPVC("pvc-v2", testNamespace, "pv-v2", testSCName)},
+			initialObjects:   []runtime.Object{createPV(testPVName, testSCName, testBucketName, csiDriverName, nil, nil, map[string]string{putil.UseProfilesV2Key: "false"}), createPV("pv-v2", testSCName, testBucketName, csiDriverName, nil, nil, nil), scValid, pvcBoundRelevant, createPVC("pvc-v2", testNamespace, "pv-v2", testSCName)},
 			expectRequeueErr: true,
 			v2Flag:           true,
 		},

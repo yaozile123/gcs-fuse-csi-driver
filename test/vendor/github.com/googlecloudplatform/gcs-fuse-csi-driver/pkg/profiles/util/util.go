@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/util"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
@@ -40,7 +41,8 @@ const (
 	AnnotationLocationType    = AnnotationPrefix + "/bucket-scan-location-type"
 	AnnotationHNSEnabled      = AnnotationPrefix + "/bucket-scan-hns-enabled"
 
-	LabelProfile = AnnotationPrefix + "/profile"
+	LabelProfile     = AnnotationPrefix + "/profile"
+	UseProfilesV2Key = "useProfilesV2"
 
 	ScanOverride = "override"
 )
@@ -158,4 +160,10 @@ func IsProfile(sc *storagev1.StorageClass) bool {
 		return true
 	}
 	return false
+}
+
+// UseProfilesV2 reports whether the PV is handled by profiles V2. V2 is never used when the driver flag is off,
+// and a PV can go back to V1 by setting the useProfilesV2 volume attribute to false.
+func UseProfilesV2(enableProfilesV2 bool, pv *v1.PersistentVolume) bool {
+	return enableProfilesV2 && pv != nil && (pv.Spec.CSI == nil || !strings.EqualFold(strings.TrimSpace(pv.Spec.CSI.VolumeAttributes[UseProfilesV2Key]), util.FalseStr))
 }

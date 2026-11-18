@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/util"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
@@ -227,6 +228,41 @@ func TestValidateStorageProfilesOverrideStatus(t *testing.T) {
 				}
 			} else if err != nil {
 				t.Fatalf("Expected no error, but got: %v", err)
+			}
+		})
+	}
+}
+
+func TestUseProfilesV2(t *testing.T) {
+	pvWithAttrs := func(attrs map[string]string) *corev1.PersistentVolume {
+		return &corev1.PersistentVolume{
+			Spec: corev1.PersistentVolumeSpec{
+				PersistentVolumeSource: corev1.PersistentVolumeSource{
+					CSI: &corev1.CSIPersistentVolumeSource{VolumeAttributes: attrs},
+				},
+			},
+		}
+	}
+
+	testCases := []struct {
+		name             string
+		enableProfilesV2 bool
+		pv               *corev1.PersistentVolume
+		want             bool
+	}{
+		{name: "flag off - should return false", enableProfilesV2: false, pv: &corev1.PersistentVolume{}, want: false},
+		{name: "nil PV - should return false", enableProfilesV2: true, pv: nil, want: false},
+		{name: "flag on and nil CSI - should return true", enableProfilesV2: true, pv: &corev1.PersistentVolume{}, want: true},
+		{name: "flag on and useProfilesV2 unset - should return true", enableProfilesV2: true, pv: pvWithAttrs(nil), want: true},
+		{name: "flag on and useProfilesV2 false - should return false", enableProfilesV2: true, pv: pvWithAttrs(map[string]string{UseProfilesV2Key: util.FalseStr}), want: false},
+		{name: "flag on and useProfilesV2 FALSE with spaces - should return false", enableProfilesV2: true, pv: pvWithAttrs(map[string]string{UseProfilesV2Key: " FALSE "}), want: false},
+		{name: "flag on and useProfilesV2 true - should return true", enableProfilesV2: true, pv: pvWithAttrs(map[string]string{UseProfilesV2Key: util.TrueStr}), want: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := UseProfilesV2(tc.enableProfilesV2, tc.pv); got != tc.want {
+				t.Errorf("UseProfilesV2(%v, %v) = %v, want %v", tc.enableProfilesV2, tc.pv, got, tc.want)
 			}
 		})
 	}

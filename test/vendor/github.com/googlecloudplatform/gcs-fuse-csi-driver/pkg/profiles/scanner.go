@@ -89,7 +89,6 @@ const (
 	anywhereCacheTTLKey             = "anywhereCacheTTL"
 	anywhereCacheZonesKey           = "anywhereCacheZones"
 	useBucketMetricsKey             = "useBucketMetrics"
-	useProfilesV2Key                = "useProfilesV2"
 
 	// Default values for PV / SC keys.
 	defaultScanTimeoutVal                  = "2m"
@@ -388,7 +387,7 @@ func NewScanner(config *ScannerConfig) (*Scanner, error) {
 // useProfilesV2 reports whether the PV is handled by profiles V2. V2 is never used when the driver flag is off,
 // and a PV can go back to V1 by setting the useProfilesV2 volume attribute to false.
 func (s *Scanner) useProfilesV2(pv *v1.PersistentVolume) bool {
-	return s.config.EnableProfilesV2 && (pv.Spec.CSI == nil || pv.Spec.CSI.VolumeAttributes[useProfilesV2Key] != util.FalseStr)
+	return profilesutil.UseProfilesV2(s.config.EnableProfilesV2, pv)
 }
 
 // run is the main function of the Scanner. It initializes necessary clients,

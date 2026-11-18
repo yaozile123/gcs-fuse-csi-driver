@@ -32,6 +32,7 @@ import (
 	"time"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/cloud_provider/auth"
 	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/cloud_provider/clientset"
 	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/cloud_provider/storage"
 	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/metrics"
@@ -5839,6 +5840,130 @@ func TestIsGKENodePoolVersionSupportedForTPUv6e(t *testing.T) {
 
 			if got := isGKENodePoolVersionSupportedForTPUv6e(tc.kubeletVersion); got != tc.want {
 				t.Errorf("isGKENodePoolVersionSupportedForTPUv6e(%q) = %v, want %v", tc.kubeletVersion, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNodePublishVolumeProfilesV2(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name               string
+		volumeID           string
+		zonalBucket        bool
+		skipCreateBucket   bool
+		cachedLocationType string
+		wantLSSD           bool
+	}{
+		{name: "regional bucket on GPU node with local SSD - should mount with lssd file cache options", wantLSSD: true},
+		{name: "zonal bucket on GPU node with local SSD - should mount with file cache size 0", zonalBucket: true},
+		{name: "dynamic mount on GPU node with local SSD - should mount with file cache size 0", volumeID: "_"},
+		{name: "bucket location lookup fails - should mount with file cache size 0", skipCreateBucket: true},
+		{name: "cached regional location type in volume state - should reuse without bucket lookup", skipCreateBucket: true, cachedLocationType: "region", wantLSSD: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			testTargetPath, cleanup := setupTestTargetPath(t)
+			defer cleanup()
+
+			volumeID := tc.volumeID
+			if volumeID == "" {
+				volumeID = testVolumeID
+			}
+
+			fakeClient := clientset.NewFakeClientset()
+			fakeClient.CreateNode(clientset.FakeNodeConfig{
+				Annotations: map[string]string{clientset.GkeAppliedNodeLabelsAnnotationKey: "cloud.google.com/gke-ephemeral-storage-local-ssd=true"},
+				Status: corev1.NodeStatus{Allocatable: corev1.ResourceList{
+					corev1.ResourceMemory: resource.MustParse("100Mi"), corev1.ResourceEphemeralStorage: resource.MustParse("100Mi"),
+					corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1"),
+				}},
+			})
+			fakeClient.CreatePod(clientset.FakePodConfig{Name: "test-pod", Namespace: "test-ns"})
+			fakeClient.CreatePV(clientset.FakePVConfig{Name: "node-publish", SCName: "gcsfusecsi-training"})
+			fakeClient.CreateSC(clientset.FakeSCConfig{
+				Name: "gcsfusecsi-training", Labels: map[string]string{"gke-gcsfuse/profile": util.TrueStr},
+				Parameters: map[string]string{VolumeContextKeySkipCSIBucketAccessCheck: util.TrueStr, "fuseFileCacheMediumPriority": "gpu:lssd"},
+			})
+
+			fakeMounter := mount.NewFakeMounter([]mount.MountPoint{})
+			driver := initTestDriverWithCustomNodeServer(t, fakeMounter, fakeClient, false)
+			driver.config.FeatureOptions.FeatureGCSFuseProfiles.Enabled = true
+			driver.config.FeatureOptions.FeatureGCSFuseProfiles.EnableProfilesV2 = true
+
+			if !tc.skipCreateBucket {
+				s, _ := driver.config.StorageServiceManager.SetupService(context.TODO(), nil, "")
+				if _, err := s.CreateBucket(context.Background(), &storage.ServiceBucket{Name: volumeID, EnableZB: tc.zonalBucket}); err != nil {
+					t.Fatalf("failed to create the fake bucket: %v", err)
+				}
+			}
+
+			req := &csi.NodePublishVolumeRequest{
+				VolumeId: volumeID, TargetPath: testTargetPath, VolumeCapability: testVolumeCapability,
+				VolumeContext: map[string]string{VolumeContextKeyPodName: "test-pod", VolumeContextKeyPodNamespace: "test-ns"},
+			}
+			ns := newNodeServer(driver, fakeMounter).(*nodeServer)
+			if tc.cachedLocationType != "" {
+				ns.volumeStateStore.Store(testTargetPath, &util.VolumeState{BucketAccessCheckPassed: true, BucketLocationType: tc.cachedLocationType})
+			}
+			if _, err := ns.NodePublishVolume(context.Background(), req); err != nil {
+				t.Fatalf("NodePublishVolume() error = %v", err)
+			}
+
+			expectedOpts := []string{"metadata-cache:stat-cache-max-size-mb:70", "file-cache:max-size-mb:0"}
+			unexpectedOpts := []string{"file-cache-medium=" + util.MediumLSSD}
+			if tc.wantLSSD {
+				expectedOpts = []string{"metadata-cache:stat-cache-max-size-mb:70", "file-cache:max-size-mb:85", "file-cache-medium=" + util.MediumLSSD}
+				unexpectedOpts = nil
+			}
+			validateMountPoint(t, fakeMounter, &mount.MountPoint{Device: volumeID, Path: testTargetPath, Type: FuseMountType, Opts: expectedOpts}, unexpectedOpts)
+		})
+	}
+}
+
+type emptyIdentityPoolTokenManager struct {
+	auth.TokenManager
+}
+
+func (emptyIdentityPoolTokenManager) GetIdentityPool() string { return "" }
+
+type emptyIdentityProviderTokenManager struct {
+	auth.TokenManager
+}
+
+func (emptyIdentityProviderTokenManager) GetIdentityProvider() string { return "" }
+
+func TestBucketLocationTokenSource(t *testing.T) {
+	t.Parallel()
+
+	hnwKSAPod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			HostNetwork: true,
+			Volumes:     []corev1.Volume{{Name: webhook.SidecarContainerSATokenVolumeName}},
+		},
+	}
+	cases := []struct {
+		name         string
+		tokenManager auth.TokenManager
+		pod          *corev1.Pod
+		args         *requestArgs
+		wantNil      bool
+	}{
+		{name: "normal WI pod - should return KSA token source", tokenManager: auth.NewFakeTokenManager(), pod: &corev1.Pod{}, args: &requestArgs{}},
+		{name: "hostNetwork pod without KSA opt-in - should use default credentials", tokenManager: auth.NewFakeTokenManager(), pod: &corev1.Pod{Spec: corev1.PodSpec{HostNetwork: true}}, args: &requestArgs{}, wantNil: true},
+		{name: "hostNetwork pod with KSA opt-in - should return KSA token source", tokenManager: auth.NewFakeTokenManager(), pod: hnwKSAPod, args: &requestArgs{optInHostnetworkKSA: true, userSpecifiedIdentityProvider: "custom-idp"}},
+		{name: "non-WI cluster with empty identity pool - should use default credentials", tokenManager: emptyIdentityPoolTokenManager{auth.NewFakeTokenManager()}, pod: &corev1.Pod{}, args: &requestArgs{}, wantNil: true},
+		{name: "non-WI cluster with empty identity provider - should use default credentials", tokenManager: emptyIdentityProviderTokenManager{auth.NewFakeTokenManager()}, pod: &corev1.Pod{}, args: &requestArgs{}, wantNil: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ns := &nodeServer{driver: &GCSDriver{config: &GCSDriverConfig{TokenManager: tc.tokenManager}}}
+			got := ns.bucketLocationTokenSource(tc.pod, map[string]string{}, tc.args)
+			if (got == nil) != tc.wantNil {
+				t.Errorf("bucketLocationTokenSource() nil = %v, wantNil %v", got == nil, tc.wantNil)
 			}
 		})
 	}
